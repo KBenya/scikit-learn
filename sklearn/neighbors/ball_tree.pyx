@@ -173,3 +173,9 @@ cdef inline DTYPE_t max_rdist_dual(BinaryTree tree1, ITYPE_t i_node1,
     else:
         return tree1.dist_metric._dist_to_rdist(max_dist_dual(tree1, i_node1,
                                                               tree2, i_node2))
+        
+
+cdef DTYPE_t min_frdist(BinaryTree tree, ITYPE_t i_node,
+                       DTYPE_t* pt, DTYPE_t* fpt) nogil except -1:
+    """function needs to be defined here as well to avoid compile error"""
+    return 0

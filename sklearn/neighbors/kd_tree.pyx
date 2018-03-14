@@ -109,6 +109,29 @@ cdef DTYPE_t min_rdist(BinaryTree tree, ITYPE_t i_node,
     return rdist
 
 
+cdef DTYPE_t min_frdist(BinaryTree tree, ITYPE_t i_node,
+                       DTYPE_t* pt, DTYPE_t* fpt) nogil except -1:
+    """Compute the filtered minimum reduced-distance
+     between a point and a node"""
+    cdef ITYPE_t n_features = tree.data.shape[1]
+    cdef DTYPE_t d, d_lo, d_hi, rdist=0.0
+    cdef ITYPE_t j
+
+    # here we'll use the fact that x + abs(x) = 2 * max(x, 0)
+    for j in range(n_features):
+        d_lo = tree.node_bounds[0, i_node, j] - pt[j]
+        d_hi = pt[j] - tree.node_bounds[1, i_node, j]
+        d = (d_lo + fabs(d_lo)) + (d_hi + fabs(d_hi))
+        
+        #fpt is the filter point, a value of 0 indicates no filter
+        if fpt[j] == 0:
+            rdist += pow(0.5 * d, tree.dist_metric.p)
+        elif fpt[j] < (0.5 * d):
+            return INF
+
+    return rdist
+
+
 cdef DTYPE_t min_dist(BinaryTree tree, ITYPE_t i_node, DTYPE_t* pt) except -1:
     """Compute the minimum distance between a point and a node"""
     if tree.dist_metric.p == INF:

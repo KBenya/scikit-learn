@@ -112,6 +112,9 @@
 # cdef DTYPE_t min_rdist(BinaryTree tree, ITYPE_t i_node, DTYPE_t* pt):
 #     """Compute the minimum reduced-distance between a point and a node"""
 
+# cdef DTYPE_t min_frdist(BinaryTree tree, ITYPE_t i_node, DTYPE_t* pt, DTYPE_t* fpt):
+#     """Compute the minimum reduced-distance between a point and a node"""
+
 # cdef DTYPE_t min_dist(BinaryTree tree, ITYPE_t i_node, DTYPE_t* pt):
 #     """Compute the minimum distance between a point and a node"""
 
@@ -1177,6 +1180,28 @@ cdef class BinaryTree:
         else:
             return self.dist_metric.rdist(x1, x2, size)
 
+    cdef inline DTYPE_t frdist(self, DTYPE_t* x1, DTYPE_t* x2,
+                              DTYPE_t* fx1) nogil except -1:
+        """Compute filtered (eucl) reduced distance between arrays x1 and x2.
+            where fx1 implies range restrictions to from x1
+        
+        """
+        self.n_calls += 1
+        cdef ITYPE_t n_features = self.data.shape[1]
+        cdef DTYPE_t d, rdist=0.0
+        cdef ITYPE_t j
+    
+        # here we'll use the fact that x + abs(x) = 2 * max(x, 0)
+        for j in range(n_features):
+            d = fabs(x1[j] - x2[j])
+            if fx1[j] == 0:
+                rdist += pow(d,2)
+            elif fx1[j] < d:
+                return INF
+    
+        return rdist
+
+
     cdef int _recursive_build(self, ITYPE_t i_node, ITYPE_t idx_start,
                               ITYPE_t idx_end) except -1:
         """Recursively build the tree.
@@ -1231,7 +1256,7 @@ cdef class BinaryTree:
 
     def query(self, X, k=1, return_distance=True,
               dualtree=False, breadth_first=False,
-              sort_results=True):
+              sort_results=True,plusfilter=False,F=[]):
         """
         query(X, k=1, return_distance=True,
               dualtree=False, breadth_first=False)
@@ -1259,7 +1284,14 @@ cdef class BinaryTree:
             if True, then distances and indices of each point are sorted
             on return, so that the first column contains the closest points.
             Otherwise, neighbors are returned in an arbitrary order.
-
+        plusfilter : boolean (default = False)
+            if True, then F needs to be passed, indicating radiuses around
+            each dimension of each query point for which data needs to be
+            filtered.
+         F : array-like, shape = [n_samples, n_features]
+            An array of radiuses to filter results for. a value of 0 means
+            no filter in that dimension, so NN search is done there
+            
         Returns
         -------
         i    : if return_distance == False
@@ -1291,6 +1323,15 @@ cdef class BinaryTree:
         cdef ITYPE_t i
         cdef DTYPE_t* pt
 
+
+        F = check_array(F, dtype=DTYPE, order='C')
+
+        #setup F, the filter radiuses
+        np_Farr = F.reshape((-1, self.data.shape[1]))
+        cdef DTYPE_t[:, ::1] Farr = get_memview_DTYPE_2D(np_Farr)
+        cdef DTYPE_t* fpt
+
+
         # initialize heap for neighbors
         cdef NeighborsHeap heap = NeighborsHeap(Xarr.shape[0], k)
 
@@ -1306,7 +1347,17 @@ cdef class BinaryTree:
         self.n_leaves = 0
         self.n_splits = 0
 
-        if dualtree:
+        if plusfilter:
+            fpt = &Farr[0, 0]
+            pt = &Xarr[0, 0]
+            with nogil:
+                for i in range(Xarr.shape[0]):
+                    reduced_dist_LB = min_frdist(self, 0, pt, fpt)
+                    self._fquery_single_depthfirst(0, pt, fpt, i, heap,
+                                                        reduced_dist_LB)
+                    pt += Xarr.shape[1]
+                    fpt += Farr.shape[1]
+        elif dualtree:
             other = self.__class__(np_Xarr, metric=self.dist_metric,
                                    leaf_size=self.leaf_size)
             if breadth_first:
@@ -1328,7 +1379,7 @@ cdef class BinaryTree:
                     for i in range(Xarr.shape[0]):
                         reduced_dist_LB = min_rdist(self, 0, pt)
                         self._query_single_depthfirst(0, pt, i, heap,
-                                                      reduced_dist_LB)
+                                                  reduced_dist_LB)
                         pt += Xarr.shape[1]
 
         distances, indices = heap.get_arrays(sort=sort_results)
@@ -1726,6 +1777,61 @@ cdef class BinaryTree:
                 self._query_single_depthfirst(i1, pt, i_pt, heap,
                                               reduced_dist_LB_1)
         return 0
+
+    cdef int _fquery_single_depthfirst(self, ITYPE_t i_node,
+                                      DTYPE_t* pt, DTYPE_t* fpt, ITYPE_t i_pt,
+                                      NeighborsHeap heap,
+                                      DTYPE_t reduced_dist_LB) nogil except -1:
+        """Recursive Single-tree k-neighbors filtered query,
+         depth-first approach"""
+        cdef NodeData_t node_info = self.node_data[i_node]
+
+        cdef DTYPE_t dist_pt, reduced_dist_LB_1, reduced_dist_LB_2
+        cdef ITYPE_t i, i1, i2
+
+        cdef DTYPE_t* data = &self.data[0, 0]
+
+        #------------------------------------------------------------
+        # Case 1: query point is outside node radius:
+        #         trim it from the query
+        if reduced_dist_LB > heap.largest(i_pt):
+            self.n_trims += 1
+
+        #------------------------------------------------------------
+        # Case 2: this is a leaf node.  Update set of nearby points
+        elif node_info.is_leaf:
+            self.n_leaves += 1 #min_frdist(self, i_node, pt, fpt)#
+            for i in range(node_info.idx_start, node_info.idx_end):
+                dist_pt = self.frdist(pt,
+                                     &self.data[self.idx_array[i], 0],
+                                     fpt)
+                if dist_pt < heap.largest(i_pt):
+                    heap._push(i_pt, dist_pt, self.idx_array[i])
+
+        #------------------------------------------------------------
+        # Case 3: Node is not a leaf.  Recursively query subnodes
+        #         starting with the closest
+        else:
+            self.n_splits += 1
+            i1 = 2 * i_node + 1
+            i2 = i1 + 1
+            reduced_dist_LB_1 = min_frdist(self, i1, pt, fpt)
+            reduced_dist_LB_2 = min_frdist(self, i2, pt, fpt)
+
+            # recursively query subnodes
+            if reduced_dist_LB_1 <= reduced_dist_LB_2:
+                self._fquery_single_depthfirst(i1, pt, fpt, i_pt, heap,
+                                              reduced_dist_LB_1)
+                self._fquery_single_depthfirst(i2, pt, fpt, i_pt, heap,
+                                              reduced_dist_LB_2)
+            else:
+                self._fquery_single_depthfirst(i2, pt, fpt, i_pt, heap,
+                                              reduced_dist_LB_2)
+                self._fquery_single_depthfirst(i1, pt, fpt, i_pt, heap,
+                                              reduced_dist_LB_1)
+        return 0
+
+
 
     cdef int _query_single_breadthfirst(self, DTYPE_t* pt,
                                         ITYPE_t i_pt,
